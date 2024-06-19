@@ -1,0 +1,283 @@
+.ymal
+pool:
+  name: Keka CI
+steps:
+  - powershell: >
+      echo 'Assemblies version number'
+
+      $buildRegexObj = [Regex]::new("\d+\.\d+\.\d+\.\d+");
+
+      $buildVersion = $buildRegexObj.Matches('$(Build.BuildNumber)')
+
+      Write-Host  $buildVersion.Value;
+
+      Write-Host "##vso[task.setvariable
+      variable=AppVersion;isOutput=true]$buildVersion"
+    displayName: Assemblies Version Number
+  - task: >-
+      colinsalmcorner.colinsalmcorner-buildtasks.version-assemblies-task.VersionAssemblies@2
+    displayName: Version Assemblies using **\AssemblyInfo.*
+    inputs:
+      sourcePath: src
+  - task: DotNetCoreCLI@2
+    displayName: Restore
+    inputs:
+      command: restore
+      projects: |
+        **/Xhr.WebAPI.csproj
+        **/Xhr.Events.csproj
+      vstsFeed: 57ad8ee8-46fe-4627-90e0-0a5e1cd447eb
+      verbosityRestore: Detailed
+      verbosityPack: Detailed
+  - task: DotNetCoreCLI@2
+    displayName: Build
+    inputs:
+      projects: |
+        **/Xhr.WebAPI.csproj
+        **/Xhr.Events.csproj
+      arguments: >-
+        --configuration $(BuildConfiguration) /p:Version=$(Build.AppVersion)
+        /p:AssemblyVersion=$(Build.AppVersion)
+      verbosityRestore: Detailed
+      verbosityPack: Detailed
+  - task: DotNetCoreCLI@2
+    displayName: Test
+    inputs:
+      command: test
+      projects: '**/*[Tt]ests/*.csproj'
+      arguments: '--configuration $(BuildConfiguration)'
+      verbosityRestore: Detailed
+      verbosityPack: Detailed
+    enabled: false
+  - task: DotNetCoreCLI@2
+    displayName: Publish API
+    inputs:
+      command: publish
+      publishWebProjects: false
+      projects: '**/Xhr.WebAPI.csproj'
+      arguments: >-
+        --configuration $(BuildConfiguration) --output
+        "$(build.artifactstagingdirectory)"
+      zipAfterPublish: true
+      verbosityRestore: Detailed
+      verbosityPack: Detailed
+      workingDirectory: src/Xhr.WebAPI
+  - task: DotNetCoreCLI@2
+    displayName: Publish WebJob
+    inputs:
+      command: publish
+      publishWebProjects: false
+      projects: '**/Xhr.Events.csproj'
+      arguments: >-
+        --configuration $(BuildConfiguration) --output
+        "$(Build.BinariesDirectory)/publish_output_$(Build.BuildNumber)/App_Data/jobs/continuous/events"
+      zipAfterPublish: false
+      modifyOutputPath: false
+      verbosityRestore: Detailed
+      verbosityPack: Detailed
+  - task: ArchiveFiles@2
+    displayName: Archive Files
+    inputs:
+      rootFolderOrFile: $(Build.BinariesDirectory)/publish_output_$(Build.BuildNumber)
+      includeRootFolder: false
+      archiveFile: $(Build.ArtifactStagingDirectory)/eventwebjob.zip
+  - task: CopyFiles@2
+    displayName: 'Copy Files to: $(build.artifactstagingdirectory)\\'
+    inputs:
+      SourceFolder: src
+      Contents: '**\Xhr.DB.Migrate\Scripts\**'
+      TargetFolder: $(build.artifactstagingdirectory)\\
+  - task: PublishBuildArtifacts@1
+    displayName: Publish Artifact
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)
+    condition: succeededOrFailed()
+
+
+######release######
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+- group: kekahr-uat-cin-01
+
+
+stages:
+- stage: Deploy
+  displayName: 'Deploy to Staging'
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy Job'
+
+steps:
+- checkout: self
+  displayName: 'Checkout primary repository'
+
+- task: AzureRmWebAppDeployment@4
+  displayName: 'Azure App Service Deploy: app-kekahr-core-api-uat-cin'
+  inputs:
+    azureSubscription: 'keka-dev'
+    WebAppName: 'app-kekahr-core-api-uat-cin'
+    deployToSlotOrASE: true
+    ResourceGroupName: 'rg-kekahr-uat-cin'
+    SlotName: staging
+    packageForLinux: '$(System.DefaultWorkingDirectory)/**/Xhr.WebAPI.zip'
+    enableCustomDeployment: true
+    TakeAppOfflineFlag: false
+    enableXmlVariableSubstitution: true
+    JSONFiles: appsettings.json
+
+- task: AzureAppServiceManage@0
+  displayName: 'Start Azure App Service: app-kekahr-core-api-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Start Azure App Service
+    WebAppName: app-kekahr-core-api-uat-cin
+    SpecifySlotOrASE: true
+    ResourceGroupName: rg-kekahr-uat-cin
+    Slot: staging
+
+- task: AzureRmWebAppDeployment@4
+  displayName: 'Azure App Service Deploy: app-kekahr-events-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    WebAppName: app-kekahr-events-uat-cin'
+    deployToSlotOrASE: true
+    ResourceGroupName: rg-kekahr-uat-cin
+    SlotName: staging
+    packageForLinux: $(System.DefaultWorkingDirectory)/**/eventwebjob.zip
+    enableXmlVariableSubstitution: true
+    JSONFiles: '**/appsettings.json'
+
+- task: AzureAppServiceManage@0
+  displayName: 'Start Azure App Service: app-kekahr-events-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Start Azure App Service
+    WebAppName: app-kekahr-events-uat-cin
+    SpecifySlotOrASE: true
+    ResourceGroupName: rg-kekahr-uat-cin
+    Slot: staging
+
+- task: johanclasson.UpdateDatabaseWithDbUp.UpdateDatabaseWithDbUp.UpdateDatabaseWithDbUp@1
+  displayName: DbUp Migration
+  inputs:
+    ConnectionString: $(ConnectionStrings.Xhr)
+    ScriptPath: '$(System.DefaultWorkingDirectory)/CI_KekaHR_API/drop/DB/Xhr.DB.Migrate/Scripts'
+    IncludeSubfolders: true
+    LogScriptOutput: true
+  continueOnError: true
+
+- task: ManualIntervention@8
+  displayName: Manual Intervention
+  inputs:
+    instructions: >-
+      Xhr Dev has been deployed to staging slot. It will be swapped with
+      production slot once the deployment has passed test cases.
+    onTimeout: resume
+  timeoutInMinutes: 1
+
+# Test Automation Pipeline
+- checkout: self
+  displayName: 'Checkout primary repository'
+
+- checkout: test-automation
+  repository: TestAutomationRepo
+  displayName: 'Checkout test automation repository'
+  persistCredentials: true
+
+- task: UseDotNet@2
+  displayName: 'Use .NET Core sdk'
+  inputs:
+    packageType: 'sdk'
+    version: '3.x'
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: Npm@1
+  displayName: 'npm install'
+  inputs:
+    command: 'install'
+    workingDir: 'test-automation'
+
+- task: Npm@1
+  displayName: 'npm run lint'
+  inputs:
+    command: 'custom'
+    workingDir: 'test-automation'
+    customCommand: 'run lint'
+
+- task: Npm@1
+  displayName: 'npm run test-corehr'
+  inputs:
+    command: 'custom'
+    workingDir: 'test-automation'
+    customCommand: 'run test-corehr'
+  continueOnError: true
+  env:
+    ADMIN_USERNAME: '$(TestUsername)'
+    ADMIN_PASSWORD: '$(TestPassword)'
+
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Pipeline Artifact'
+  inputs:
+    targetPath: 'test-automation/reports/html-reports/CoreHR'
+    artifactName: 'CoreHRReports'
+  condition: succeededOrFailed()
+
+- task: PublishTestResults@2
+  displayName: 'Publish Test Results'
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: 'test-automation/reports/junit-results/**/*.xml'
+    mergeTestResults: true
+    failTaskOnFailedTests: true
+    failTaskOnFailureToPublishResults: true
+    failTaskOnMissingResultsFile: true
+    testRunTitle: 'CoreHR results'
+  continueOnError: true
+
+# Post-Test Automation Tasks
+- task: AzureAppServiceManage@0
+  displayName: 'Complete Swap: app-kekahr-core-api-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Complete Swap
+    WebAppName: app-kekahr-core-api-uat-cin
+    ResourceGroupName: rg-kekahr-uat-cin
+    SourceSlot: staging
+
+- task: AzureAppServiceManage@0
+  displayName: 'Complete Swap: app-kekahr-events-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Complete Swap
+    WebAppName: app-kekahr-events-uat-cin
+    ResourceGroupName: rg-kekahr-uat-cin
+    SourceSlot: staging
+
+- task: ManualIntervention@8
+  displayName: Manual Intervention
+  inputs:
+    onTimeout: resume
+  timeoutInMinutes: 1
+
+- task: AzureAppServiceManage@0
+  displayName: 'Stop Azure App Service: app-kekahr-core-api-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Stop Azure App Service
+    WebAppName: app-kekahr-core-api-uat-cin
+    SpecifySlotOrASE: true
+    ResourceGroupName: rg-kekahr-uat-cin
+    Slot: staging
+
+- task: AzureAppServiceManage@0
+  displayName: 'Stop Azure App Service: app-kekahr-events-uat-cin'
+  inputs:
+    azureSubscription: keka-dev
+    Action: Stop Azure App Service
+    WebAppName: app-kekahr-events-uat-cin
+    SpecifySlotOrASE: true
+    ResourceGroupName: rg-kekahr-uat-cin
+    Slot: staging
